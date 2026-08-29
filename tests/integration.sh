@@ -117,7 +117,7 @@ status=$?
 set -e
 
 if [ "$status" -ne 0 ]; then
-    if grep -E "clone six namespaces|user-namespace policy|cgroup controller|delegated cgroup|Operation not permitted|Permission denied" \
+    if grep -E "clone six namespaces|user-namespace policy|cgroup controller|delegated cgroup|child (make mount propagation private|bind root filesystem|make root bind private|construct minimal /dev|apply rootfs mount flags|pivot root|detach old root|mount isolated /proc): (Operation not permitted|Permission denied)" \
         "$temporary/error" >/dev/null 2>&1; then
         skip "host policy does not permit the required namespace/mount/cgroup setup"
     fi

@@ -59,7 +59,7 @@ test-integration:
 	@echo "integration test skipped: Linux is required"
 endif
 
-test: test-unit test-cli test-integration
+test: test-lines test-unit test-cli test-integration
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -69,3 +69,12 @@ clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
 
 -include $(DEPS)
+
+.PHONY: test-lines test-docker
+test-lines:
+	@lines=$$(awk -f tests/count_source_lines.awk src/*.c src/*.h); \
+	echo "Runtime source: $$lines lines (maximum 550; comments, blank lines and formatting-only lines excluded)"; \
+	test $$lines -le 550
+
+test-docker:
+	./tests/docker.sh
