@@ -2,9 +2,11 @@
 
 Contained is a small Linux container-runtime CLI written in C. It starts one command in a new set of kernel namespaces, gives that command a private root mount, applies cgroup v2 and `setrlimit(2)` resource ceilings, removes Linux capabilities, and installs a default-deny libseccomp filter. It is intended for learning and controlled local experiments, not as a replacement for a maintained OCI runtime.
 
+The implementation is **539 lines** across `src/contained.c`, `src/config.c`, and `src/config.h`, excluding comments, blank lines, and formatting-only lines such as a bare `}`. Tests, build scripts, and documentation are counted separately. `make test-lines`, part of `make test`, enforces the 550-line ceiling with the same counter (`tests/count_source_lines.awk`). The earlier implementation measured 1,136 lines under that rule: repeated diagnostics, one-call wrapper functions, and verbose parsing had accumulated, and this version consolidates those paths and drives repeated setup from tables.
+
 ## Prerequisites
 
-- Linux with user namespaces and cgroup v2 enabled
+- Linux 5.9+ with user namespaces, `close_range(2)`, and cgroup v2 enabled (tested on arm64; clone filtering assumes arm64/x86-64 argument ordering)
 - a writable cgroup v2 parent delegated with the `memory`, `cpu`, and `pids` controllers
 - a C11 compiler, GNU make, `pkg-config`, libcap development headers, and libseccomp 2.5 or newer
 - a dedicated root filesystem containing the workload and its libraries, plus real `/proc` and `/dev` directories to use as mountpoints
@@ -47,20 +49,20 @@ The parent validates paths and allocates a 1 MiB `mmap`-backed child stack with 
 5. **network** (`CLONE_NEWNET`)
 6. **user** (`CLONE_NEWUSER`)
 
-A `SOCK_SEQPACKET` synchronization channel keeps the child blocked. Before the parent changes `/proc/<pid>/setgroups`, the child clears inherited supplementary groups and sends a ready token. The parent writes `deny` to `setgroups`, maps container UID/GID 0 to the invoking real UID/GID, creates a unique cgroup, writes `memory.max`, `memory.swap.max`, `cpu.max`, and `pids.max`, and moves the blocked child into it. Only then does it release the child.
+A `SOCK_SEQPACKET` synchronization channel keeps the child blocked. The child sends a ready token, then the parent writes `deny` to `/proc/<pid>/setgroups`, maps container UID/GID 0 to the invoking real UID/GID, creates a unique cgroup, writes `memory.max`, `memory.swap.max`, `cpu.max`, and `pids.max`, and moves the blocked child into it. Only then does it release the child. Linux requires this ordering for an unprivileged GID map: `setgroups(2)` is unavailable before a new namespace has a GID map, and writing `deny` is required before the invoking user may install that map.
 
 The child becomes PID 1 in the new PID namespace and performs privileged setup while it still has capabilities in its new user namespace:
 
 1. switch to mapped UID/GID 0 and set the UTS hostname;
 2. recursively make host mount propagation private;
 3. bind the supplied rootfs, apply `nosuid`/`nodev` and read-only flags, and construct a fresh `/dev` tmpfs with only null/zero/full/random/urandom, optional tty, a private devpts instance, and `/dev/shm`;
-4. use `pivot_root(2)` and detach the old root, then mount a PID-namespace-specific `/proc`;
+4. use `pivot_root(2)` and detach the old root, with a PID-namespace-specific `/proc` mounted before the pivot;
 5. set `no_new_privs`, disable dumpability, empty the capability bounding, permitted, effective, inheritable, and ambient sets, and lock securebits;
 6. apply `RLIMIT_AS`, `RLIMIT_NPROC`, `RLIMIT_NOFILE`, `RLIMIT_CORE`, and `RLIMIT_MEMLOCK` bounds;
 7. close every inherited file descriptor except standard input/output/error;
 8. load the seccomp allowlist and `execvp(3)` the workload.
 
-The parent forwards `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` to the child's process group and returns the workload's exit status. A parent-death signal kills a child whose supervisor disappears. On normal exit and every handled setup failure, the parent aborts/reaps the child, asks cgroup v2 to kill stragglers, retries cgroup removal while descendants drain, closes synchronization descriptors, and unmaps the dedicated stack. Namespace-owned mounts disappear with the child mount namespace.
+The parent forwards `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` to the child's process group and returns the workload's exit status. When standard input is a terminal, it transfers the foreground terminal process group to the workload and restores it afterward, so interactive shells can read commands normally. A parent-death signal kills a child whose supervisor disappears. On normal exit and every handled setup failure, the parent aborts/reaps the child, relies on PID-namespace init exit to kill descendants, retries cgroup removal while they drain, closes synchronization descriptors, and unmaps the dedicated stack. Namespace-owned mounts disappear with the child mount namespace.
 
 ## Resource flags
 
@@ -76,6 +78,7 @@ Core dumps and memory locking are independently bounded to zero. A limit that th
 ## Security boundaries
 
 - The user namespace maps only one UID and one GID. Container root is the invoking host identity; it is **not** permission to files that identity could not already access. Running Contained as host root maps container root to host root and therefore weakens this boundary.
+- Supplementary group IDs are inherited. In rootless mode Linux requires `setgroups` to be permanently disabled before installing the GID map, so the runtime cannot clear that list. IDs other than the invoking primary GID are unmapped inside the container, but the workload may retain the same group-based access to the supplied rootfs that the invoking process already had.
 - The mount namespace does not make unsafe rootfs contents safe. Do not include Docker/containerd sockets, SSH agents, credentials, device nodes, or bind mounts into host data. The host root `/` is explicitly rejected.
 - The network namespace starts with no configured external interface. Seccomp permits creation of `AF_UNIX` sockets only; internet sockets, namespace manipulation, mounts, `ptrace`, eBPF, perf events, keyrings, kernel modules, and reboot operations remain denied by the default action.
 - Capabilities are dropped only after mount and hostname setup. File capabilities cannot restore them because the bounding set is empty and `no_new_privs` is set.
@@ -85,11 +88,15 @@ Core dumps and memory locking are independently bounded to zero. A limit that th
 ## Checks
 
 ```sh
+make test-lines
+make test-docker # Docker on Colima; integration skips are failures here
 make test-unit
 make test-cli
 make test-integration
 make test
 ```
+
+The Docker target also checks workload exit codes, signal forwarding, cgroup values and cleanup, read-only/writable rootfs behavior, rejected symlink mountpoints, inherited descriptor closure, seccomp syscall decisions, and interactive terminal input. It copies source into a disposable Ubuntu container and requires Docker access plus package-download connectivity.
 
 The unit check covers byte/count/CPU parsing, hostname validation, and complete option parsing without requiring privilege. The CLI check covers user-facing validation diagnostics on Linux. The integration check verifies all six namespace identities, hostname isolation, the file-descriptor limit, empty effective/bounding capability sets, `no_new_privs`, and seccomp mode. It exits with status 77 (reported as a skip by the Makefile) on non-Linux hosts or when user namespaces, required mount permissions, a delegated cgroup v2 parent, or a usable test rootfs are unavailable. Set `CONTAINED_TEST_ROOTFS` and optionally `CONTAINED_CGROUP_PARENT` for CI. A static BusyBox rootfs is created automatically when available.
 
